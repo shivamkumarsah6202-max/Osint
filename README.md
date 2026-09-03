@@ -1,23 +1,37 @@
-# Telegram Demo Bot
+# Telegram Demo Bot — 30 Second Auto Delete
 
-## Render Environment Variables
+This package is intended for authorized/demo APIs only.
 
-Set these in Render:
-- BOT_TOKEN = your NEW Telegram bot token
-- API_URL = your authorized/demo API endpoint including the parameter prefix
+## Files
 
-Example:
-API_URL=https://example.com/api/demo?value=
+- `bot.py` — Telegram bot
+- `requirements.txt` — dependencies
+- `README.md` — setup instructions
 
-## Commands
-/start
-/lookup
+## Railway / Render environment variables
 
-The successful result message is deleted after 10 seconds.
+Set:
 
-IMPORTANT:
-The one-use restriction is stored in memory and resets when the Render
-worker restarts/redeploys. Use a database such as PostgreSQL if you need
-a persistent one-use limit.
+`BOT_TOKEN=YOUR_NEW_BOT_TOKEN`
 
-Use this only with an API and data you are authorized to access.
+`API_URL=https://example.com/api/demo?value=`
+
+Do NOT put a bot token directly in `bot.py`.
+
+## Features
+
+- `/start`
+- `/lookup`
+- JSON response formatting
+- Large JSON is split into Telegram-safe chunks
+- Every result chunk is deleted after 30 seconds
+- HTTP timeout and API error handling
+- One successful lookup per Telegram user while the process is running
+
+## Important limitation
+
+`used_users` is stored in RAM. Railway/Render restarts clear it.
+
+For a permanent one-use restriction, use a database such as PostgreSQL.
+
+Use only data and APIs you are authorized to access. Do not use the bot to retrieve or expose private personal information.
