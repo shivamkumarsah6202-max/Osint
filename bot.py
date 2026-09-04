@@ -56,7 +56,7 @@ def sanitize_record(record):
 
 def format_result(result, query):
     lines = [
-        "🔍 NUMBER LOOKUP RESULT",
+        "🔍 NUMBER LOOKUP RESULT BY BANTI",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         "",
         f"Lookup Result for: {mask_phone(query)}",
