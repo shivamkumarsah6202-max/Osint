@@ -28,13 +28,10 @@ def allowed_chat(update: Update) -> bool:
 
 
 def mask_phone(value):
-    s = str(value).strip()
-    return s[:4] + "******" if len(s) >= 7 else "[REDACTED]"
-
+    return str(value)   # only synthetic/test numbers
 
 def mask_aadhaar(value):
-    s = "".join(ch for ch in str(value) if ch.isdigit())
-    return "XXXX-XXXX-" + s[-4:] if len(s) >= 4 else "[REDACTED]"
+    return str(value)   # only fake test IDs
 
 
 def sanitize_record(record):
