@@ -5,24 +5,16 @@ import logging
 import aiohttp
 
 from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-# Set these in Railway/Render environment variables.
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 API_URL = os.environ["API_URL"]
-
+ALLOWED_CHAT_ID = -1004296474498
 DELETE_AFTER_SECONDS = 30
 MAX_TELEGRAM_MESSAGE = 4000
 
-# In-memory one-use limit. This resets after a service restart/redeploy.
 used_users = set()
+_bot_app = None
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -31,154 +23,185 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def split_text(text: str, limit: int = MAX_TELEGRAM_MESSAGE):
-    """Split a large string into Telegram-safe chunks."""
-    return [text[i:i + limit] for i in range(0, len(text), limit)] or ["{}"]
+def allowed_chat(update: Update) -> bool:
+    return bool(update.effective_chat and update.effective_chat.id == ALLOWED_CHAT_ID)
 
 
-def pretty_json(data):
-    return json.dumps(data, indent=2, ensure_ascii=False)
+def mask_phone(value):
+    s = str(value).strip()
+    return s[:4] + "******" if len(s) >= 7 else "[REDACTED]"
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["waiting_for_input"] = False
-    await update.message.reply_text(
-        "👋 Welcome!\n\n"
-        "Demo num lookup ke liye /lookup use karein.\n"
-        "Successful lookup ke baad result 30 seconds mein delete ho jayega.\n"
-        "Har user ko 1 successful lookup allowed hai. (Api expire:-04-09-26) "
-    )
+def mask_aadhaar(value):
+    s = "".join(ch for ch in str(value) if ch.isdigit())
+    return "XXXX-XXXX-" + s[-4:] if len(s) >= 4 else "[REDACTED]"
 
 
-async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+def sanitize_record(record):
+    """Render API data while preventing exposure of highly sensitive fields."""
+    if not isinstance(record, dict):
+        return None
 
-    if user_id in used_users:
-        await update.message.reply_text(
-            "❌ Aap apna allowed lookup already use kar chuke hain."
-        )
-        return
+    name = str(record.get("name") or "Unknown").strip()
+    fname = str(record.get("fname") or "—").strip()
+    mobile = mask_phone(record.get("mobile", ""))
+    circle = str(record.get("circle") or "—").strip()
+    return {
+        "name": name,
+        "fname": fname,
+        "mobile": mobile,
+        "circle": circle,
+        "address": "[REDACTED]",
+        "aadhaar": mask_aadhaar(record.get("aadhaar") or record.get("aadhar") or record.get("id") or ""),
+        "alternate": mask_phone(record.get("alt") or ""),
+    }
 
-    context.user_data["waiting_for_input"] = True
-    await update.message.reply_text("🔎 Demo input bhejiye:")
+
+def format_result(result, query):
+    lines = [
+        "🔍 NUMBER LOOKUP RESULT",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+        f"Lookup Result for: {mask_phone(query)}",
+        "────────────────────────",
+    ]
+
+    records = result.get("results", []) if isinstance(result, dict) else []
+    if not isinstance(records, list):
+        records = []
+
+    seen = set()
+    clean_records = []
+    for record in records:
+        clean = sanitize_record(record)
+        if not clean:
+            continue
+        key = tuple(clean.items())
+        if key not in seen:
+            seen.add(key)
+            clean_records.append(clean)
+
+    if not clean_records:
+        lines.append("❌ No results found.")
+    else:
+        for i, r in enumerate(clean_records):
+            if i:
+                lines.extend(["", "────────────────────────", "📌 Additional Result:"])
+            else:
+                lines.append("")
+            lines.extend([
+                f"👤 Name: {r['name']}",
+                f"👨‍👦 Father Name: {r['fname']}",
+                f"📱 Mobile: {r['mobile']}",
+                f"🏠 Address: {r['address']}",
+                f"📡 Circle: {r['circle']}",
+                f"🪪 Aadhaar/ID: {r['aadhaar']}",
+                f"📞 Alternate: {r['alternate']}",
+            ])
+
+    # Do not display API/vendor metadata or HTTP status fields in the Telegram output.
+    lines.extend([
+        "",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "⏰ Result auto-deletes in 30 seconds",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    ])
+    return "\n".join(lines)
 
 
 async def delete_later(chat_id, message_id, delay):
     await asyncio.sleep(delay)
     try:
-        await context_bot_delete(chat_id, message_id)
+        if _bot_app:
+            await _bot_app.bot.delete_message(chat_id=chat_id, message_id=message_id)
     except Exception as exc:
         logger.warning("Could not delete message %s: %s", message_id, exc)
 
 
-# Telegram Bot API access is supplied through this lightweight helper.
-_bot_app = None
-
-
-async def context_bot_delete(chat_id, message_id):
-    if _bot_app is None:
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed_chat(update):
         return
-    await _bot_app.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    context.user_data["waiting_for_input"] = False
+    await update.message.reply_text(
+        "👋 Welcome!\n\n"
+        "Use /lookup to request an authorized lookup.\n"
+        "Results are automatically deleted after 30 seconds."
+    )
 
 
-async def send_json_result(update: Update, data):
-    text = pretty_json(data)
-    chunks = split_text(text)
+async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed_chat(update):
+        return
+    user_id = update.effective_user.id
+    if user_id in used_users:
+        await update.message.reply_text("❌ Your free lookup has already been used.")
+        return
+    context.user_data["waiting_for_input"] = True
+    await update.message.reply_text("🔎 Send the lookup value:")
 
-    sent_messages = []
-    for index, chunk in enumerate(chunks):
-        prefix = f"JSON ({index + 1}/{len(chunks)})\n" if len(chunks) > 1 else ""
-        # Plain text avoids MarkdownV2 escaping failures with arbitrary JSON.
-        msg = await update.message.reply_text(
-            prefix + chunk,
-            disable_web_page_preview=True,
-        )
-        sent_messages.append(msg)
 
-    # Delete every result chunk after 30 seconds.
-    for msg in sent_messages:
-        asyncio.create_task(
-            delete_later(
-                msg.chat_id,
-                msg.message_id,
-                DELETE_AFTER_SECONDS,
-            )
-        )
+async def send_result(update: Update, text: str):
+    chunks = [text[i:i + MAX_TELEGRAM_MESSAGE] for i in range(0, len(text), MAX_TELEGRAM_MESSAGE)] or ["❌ Empty result."]
+    for chunk in chunks:
+        msg = await update.message.reply_text(chunk, disable_web_page_preview=True)
+        asyncio.create_task(delete_later(msg.chat_id, msg.message_id, DELETE_AFTER_SECONDS))
 
 
 async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
+    if not allowed_chat(update):
+        return
     if not context.user_data.get("waiting_for_input"):
         return
 
+    user_id = update.effective_user.id
     if user_id in used_users:
         context.user_data["waiting_for_input"] = False
-        await update.message.reply_text(
-            "❌ Aapka allowed lookup already use ho chuka hai."
-        )
+        await update.message.reply_text("❌ Your free lookup has already been used.")
         return
 
-    value = update.message.text.strip()
-
+    value = (update.message.text or "").strip()
     if not value or len(value) > 200:
-        await update.message.reply_text("❌ Invalid demo input.")
+        await update.message.reply_text("❌ Invalid input.")
         return
 
     context.user_data["waiting_for_input"] = False
 
     try:
-        # API_URL must point to an authorized/demo endpoint and already
-        # contain the parameter prefix, e.g. ...?value=
         url = f"{API_URL}{value}"
-
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url) as response:
                 if response.status != 200:
-                    await update.message.reply_text(
-                        f"❌ API error: HTTP {response.status}"
-                    )
+                    await update.message.reply_text(f"❌ API error: HTTP {response.status}")
                     return
-
                 try:
                     result = await response.json(content_type=None)
                 except Exception:
-                    raw = await response.text()
-                    await update.message.reply_text(
-                        "❌ API ne valid JSON return nahi kiya."
-                    )
-                    logger.warning("Non-JSON API response: %s", raw[:500])
+                    await update.message.reply_text("❌ API ne valid JSON return nahi kiya.")
                     return
 
-        # Only successful responses consume the one-use allowance.
-        if isinstance(result, dict) and result.get("success") is True:
+        if isinstance(result, dict) and (result.get("success") is True or result.get("status_code") == 200):
             used_users.add(user_id)
 
-        await send_json_result(update, result)
+        await send_result(update, format_result(result, value))
 
     except asyncio.TimeoutError:
         await update.message.reply_text("❌ API request timeout.")
-    except aiohttp.ClientError as exc:
-        logger.exception("HTTP error: %s", exc)
+    except aiohttp.ClientError:
+        logger.exception("HTTP error")
         await update.message.reply_text("❌ API connection error.")
-    except Exception as exc:
-        logger.exception("Unexpected error: %s", exc)
+    except Exception:
+        logger.exception("Unexpected error")
         await update.message.reply_text("❌ Data fetch nahi ho saka.")
 
 
 def main():
     global _bot_app
-
     _bot_app = Application.builder().token(BOT_TOKEN).build()
-
     _bot_app.add_handler(CommandHandler("start", start))
     _bot_app.add_handler(CommandHandler("lookup", lookup))
-    _bot_app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input)
-    )
-
-    logger.info("🤖 Bot started")
+    _bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_input))
+    logger.info("Bot started; allowed chat: %s", ALLOWED_CHAT_ID)
     _bot_app.run_polling()
 
 
